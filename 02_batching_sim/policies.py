@@ -23,11 +23,18 @@ def naive_batching(requests: list[Request], cost: CostModel, max_batch_size: int
         if clock < pending[next_idx].arrival_time:
             clock = pending[next_idx].arrival_time
 
-        # form the batch
+                # form the batch
         batch: list[Request] = []
         while next_idx < len(pending) and len(batch) < max_batch_size:
             batch.append(pending[next_idx])
             next_idx += 1
+
+        # wait until every member of the batch has arrived before
+        # prefilling any of them. this is what static batching does:
+        # it collects a full batch, then runs it.
+        latest_arrival = max(r.arrival_time for r in batch)
+        if clock < latest_arrival:
+            clock = latest_arrival
 
         # prefill each request in the batch (sequential prefills)
         for r in batch:

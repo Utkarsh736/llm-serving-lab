@@ -9,7 +9,7 @@ Five layers, built in order:
 | Layer | Directory | Status |
 |---|---|---|
 | KV cache | `01_kv_cache/` | ✅ done |
-| Continuous batching | `02_batching_sim/` | planned |
+| Continuous batching | `02_batching_sim/` | ✅ done |
 | Paged memory | `03_paged_memory/` | planned |
 | vLLM config sweep | `04_serving_benchmarks/` | planned |
 | FastAPI gateway | `05_gateway/` | planned |
@@ -74,3 +74,97 @@ is what Milestone 3's paged memory model will manage.
 ```bash
 uv run 01_kv_cache/benchmark.py
 ```
+
+## 2. Continuous batching
+
+### What it is
+
+Autoregressive serving processes one decode step at a time. When multiple
+requests are in flight, the scheduler decides how many to run in each step
+and when to admit new requests. Two policies:
+
+- **Naive (static) batching:** collect `max_batch_size` requests, run them
+  to completion, then take the next batch. A request that finishes early
+  leaves its slot idle until the slowest member finishes.
+- **Continuous (iteration-level) batching:** at every decode iteration,
+  refill any free slots from the queue. A request that finishes frees its
+  slot immediately; a new request is prefilled and joins the next step.
+
+The idea is from [Orca (Yu et al., 2022)](https://www.usenix.org/conference/osdi22/presentation/yu)
+and is the core innovation in vLLM, TGI, and TensorRT-LLM.
+
+### What we built
+
+A token-level scheduler simulator — no real model, no GPU. The cost of
+each scheduling decision is modeled by a simple latency function
+(`02_batching_sim/simulator.py:CostModel`), so we can isolate the
+*scheduling* effect from compute and memory.
+
+- `simulator.py` — request, cost model, result types
+- `policies.py` — naive and continuous batchers
+- `workloads.py` — Poisson arrivals, log-normal prompt/output lengths
+- `benchmark.py` — 10/50/100 users × both policies, produces CSV + charts
+
+### Results
+
+Workload: Poisson arrivals at 5 req/s, log-normal prompt length (median 50)
+and output length (median 80), `max_batch_size=8`.
+
+| users | policy | throughput | TTFT P50 | P95 e2e latency |
+|---|---|---|---|---|
+| 10  | naive      | 2.32 req/s | 1370 ms   | 2631 ms  |
+| 10  | continuous | 3.79 req/s | 13 ms     | 964 ms   |
+| 50  | naive      | 2.09 req/s | 6004 ms   | 14615 ms |
+| 50  | continuous | 4.52 req/s | 18 ms     | 2983 ms  |
+| 100 | naive      | 2.06 req/s | 12445 ms  | 29644 ms |
+| 100 | continuous | 4.43 req/s | 18 ms     | 3225 ms  |
+
+![Throughput vs concurrency](02_batching_sim/throughput.png)
+![P95 latency vs concurrency](02_batching_sim/latency_p95.png)
+
+### What the numbers mean
+
+**Naive throughput degrades with concurrency; continuous stays flat.**
+Naive batches wait for their slowest member. As concurrency rises, the
+number of batches rises, and each one is a fresh draw from a heavy-tailed
+output-length distribution. More batches → more straggler stalls → lower
+average throughput. Continuous decouples slots: a long request occupies
+one, other slots keep turning over.
+
+**Tail latency diverges by ~9× at 100 users.** Naive queues requests
+behind full batches, so tail latency explodes. Continuous admits each
+request as soon as a slot opens.
+
+**Continuous also wins at low concurrency — for a different reason.**
+At 10 users, naive TTFT P50 is 1.4 s because the batcher *waits* for a
+full batch to assemble. Continuous starts the moment a request arrives.
+So the win isn't only "throughput under load"; it's also "no batch-fill
+wait at low load."
+
+### The tradeoff
+
+Continuous batching is a throughput and tail-latency win, not a free
+lunch. Two honest costs:
+
+1. **Prefill interference.** When a new request joins, its prefill blocks
+   the current decode step, briefly raising ITL for requests already in
+   the batch. Production systems mitigate this with *chunked prefill*
+   (split prefills into small pieces and interleave with decode). Our
+   simulation shows a small ITL effect because prefills are cheap here;
+   with long prompts it would dominate.
+2. **Scheduler complexity.** Iteration-level bookkeeping (per-request
+   state, KV cache lifetimes, fairness) is more intricate than
+   "run this batch."
+
+Both are why serving engines are nontrivial software.
+
+### Reproduce
+
+    uv run 02_batching_sim/benchmark.py
+
+### Next
+
+The scheduler models a batch's *cost* but not the *memory* its requests
+occupy. In real serving, each running request holds a KV cache that grows
+with its sequence length. Milestone 3 builds a paged memory model to
+allocate and free those caches without fragmenting GPU memory.

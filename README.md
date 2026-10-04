@@ -168,3 +168,90 @@ The scheduler models a batch's *cost* but not the *memory* its requests
 occupy. In real serving, each running request holds a KV cache that grows
 with its sequence length. Milestone 3 builds a paged memory model to
 allocate and free those caches without fragmenting GPU memory.
+
+## 3. Paged KV memory
+
+### The problem
+
+A running request holds a KV cache that grows with its sequence length.
+At admission time you don't know how long it will grow to. The naive
+solution — reserve `max_seq_len` per sequence — wastes memory
+proportional to the gap between the reservation and the actual length.
+
+At `max_seq_len = 2048` and a real median length of ~200 tokens, that's
+roughly 10× over-reservation per sequence. Multiply by concurrent
+requests and the pool fills up before the compute does.
+
+### What we built
+
+A fixed-size block allocator with per-sequence page tables. Each
+sequence's KV cache is split into fixed-size blocks (`BLOCK_SIZE` tokens
+each) allocated on demand. A sequence's blocks are scattered across the
+pool but indexed by a logical-to-physical mapping (`page_table`), so
+attention reads look contiguous. Same idea as vLLM's PagedAttention.
+
+Files:
+
+- `block_manager.py` — allocator and page tables
+- `fragmentation.py` — paged vs naive vs fixed-slot comparison
+- `benchmark.py` — block-size sweep with memory overhead accounting
+
+### Results — same pool, three strategies
+
+Pool: 4,096 blocks × 16 slots = 65,536 token slots (~12 GB at this
+model's KV geometry). Workload: 500 sequences, prompt ~logNormal(60, 0.7),
+output ~logNormal(100, 0.8).
+
+| strategy | admitted concurrent | waste |
+|---|---|---|
+| **paged (bs=16)** | **284** | 1,940 slots (3.0% of pool) |
+| naive (reserve 2048) | 32 | 58,439 slots (89% of pool) |
+| fixed (reserve 200) | 300 admitted, **200 rejected** | — |
+
+**Paged admits 8.9× more concurrent sequences than naive pre-allocation**,
+at bounded waste. The fixed-slot strategy admits slightly more than paged
+but *rejects* 40% of requests that exceed the reservation — an unacceptable
+trade in production.
+
+### Block size tradeoff
+
+![Block size tradeoff](03_paged_memory/tradeoff.png)
+
+Sweeping block size on a fixed slot pool:
+
+- **Smaller blocks → less waste.** Waste per sequence is bounded by
+  `BLOCK_SIZE - 1` slots. At bs=4, aggregate waste is 0.65% of the pool;
+  at bs=128, it's 21%.
+- **Smaller blocks → larger page tables.** Each logical block costs
+  4 bytes of metadata per sequence. At bs=4, the pool needs 64 KB of
+  page tables; at bs=128, 2 KB.
+- **Total memory overhead is minimized at small blocks** in this model —
+  the memory-optimal block size is bs=4.
+
+### Why vLLM uses 16, not 4
+
+Our model captures waste bytes and page-table bytes. It does **not**
+capture kernel efficiency:
+
+- Each logical block is a separate gather from global memory. Small
+  blocks mean more gathers per attention step.
+- GPU memory transactions are 32–128 bytes. A bs=4 block (fp16,
+  6 heads × 64 head_dim) is ~3 KB — too small to amortize the transaction
+  cost well.
+- Larger blocks let the PagedAttention kernel amortize per-block overhead.
+
+The memory-optimal block size is a lower bound. The realized production
+choice (16) sits above it because the kernel imposes a cost the memory
+model doesn't see. That gap is what the hardware benchmark in Milestone 4
+will make visible.
+
+### Reproduce
+
+    uv run 03_paged_memory/fragmentation.py
+    uv run 03_paged_memory/benchmark.py
+
+### Next
+
+Paging gives us a memory allocator. Milestone 4 replaces our simulated
+cost model with real vLLM on a T4, and measures what all of this looks
+like when actual kernels are involved.

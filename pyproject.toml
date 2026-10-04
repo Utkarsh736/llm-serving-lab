@@ -3,10 +3,14 @@ name = "llm-serving-lab"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
+    "fastapi>=0.142.2",
+    "httpx>=0.28.1",
     "matplotlib>=3.11.2",
     "numpy>=2.4.6",
     "pandas>=3.0.6",
+    "python-dotenv>=1.2.4",
     "torch>=2.14.1",
+    "uvicorn>=0.54.0",
 ]
 
 [dependency-groups]

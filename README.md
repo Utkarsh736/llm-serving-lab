@@ -10,8 +10,8 @@ Five layers, built in order:
 |---|---|---|
 | KV cache | `01_kv_cache/` | ✅ done |
 | Continuous batching | `02_batching_sim/` | ✅ done |
-| Paged memory | `03_paged_memory/` | planned |
-| vLLM config sweep | `04_serving_benchmarks/` | planned |
+| Paged memory | `03_paged_memory/` | ✅ done |
+| vLLM config sweep | `04_serving_benchmarks/` | ✅ done |
 | FastAPI gateway | `05_gateway/` | planned |
 
 ## 1. KV cache
@@ -159,16 +159,9 @@ lunch. Two honest costs:
 Both are why serving engines are nontrivial software.
 
 ### Reproduce
-
+```bash
     uv run 02_batching_sim/benchmark.py
-
-### Next
-
-The scheduler models a batch's *cost* but not the *memory* its requests
-occupy. In real serving, each running request holds a KV cache that grows
-with its sequence length. Milestone 3 builds a paged memory model to
-allocate and free those caches without fragmenting GPU memory.
-
+```
 ## 3. Paged KV memory
 
 ### The problem
@@ -246,12 +239,92 @@ model doesn't see. That gap is what the hardware benchmark in Milestone 4
 will make visible.
 
 ### Reproduce
-
+```bash
     uv run 03_paged_memory/fragmentation.py
     uv run 03_paged_memory/benchmark.py
+```
+
+
+## 4. vLLM on real hardware
+
+### What we measured
+
+Ran vLLM 0.30.0 on a Colab T4 serving `Qwen/Qwen2.5-0.5B-Instruct`. Swept
+`max_num_seqs ∈ {8, 32}` at concurrency 1, 4, and 16. This is the first
+milestone that touches a real engine on real hardware — everything before
+was simulation.
+
+Workload per run: 100 prompts, 128 input tokens, 128 output tokens, random
+dataset, Poisson arrivals. Metrics from vLLM's `benchmark_serving`.
+
+### Results (fp16)
+
+| config | conc | output tps | TTFT P50 | TTFT P99 | e2e P50 | e2e P99 |
+|---|---|---|---|---|---|---|
+| mns=8  | 1  | 162  | 34 ms  | 59 ms    | 811 ms  | 852 ms   |
+| mns=8  | 4  | 542  | 66 ms  | 2792 ms  | 852 ms  | 3576 ms  |
+| mns=8  | 16 | 1023 | 121 ms | 1100 ms  | 1230 ms | 2043 ms  |
+| mns=32 | 1  | 156  | 35 ms  | 65 ms    | 811 ms  | 852 ms   |
+| mns=32 | 4  | 524  | 67 ms  | 2863 ms  | 858 ms  | 3587 ms  |
+| mns=32 | 16 | 901  | 122 ms | 3343 ms  | 1230 ms | 4481 ms  |
+
+![Throughput vs concurrency](04_serving_benchmarks/throughput.png)
+![Tail TTFT vs concurrency](04_serving_benchmarks/ttft_p99.png)
+
+### What the numbers mean
+
+**Throughput scales roughly linearly with concurrency up to 16.** For
+`mns=8`, 162 → 1023 tps as concurrency goes 1 → 16. This is the
+continuous-batching win that Milestone 2 predicted, now measured on a
+real GPU with a real engine.
+
+**Smaller `max_num_seqs` beats larger at high concurrency.** At c=16,
+`mns=8` reaches **1023 tps** vs `mns=32`'s **901 tps** — and its tail
+TTFT is **3× lower** (1100 ms vs 3343 ms). The GPU is memory-bandwidth-
+bound at decode, and a batch of 16 costs more than 2× a batch of 8 per
+step (KV cache reads grow superlinearly with batch width). `mns=8` also
+frees slots sooner, so queued requests start earlier.
+
+**This is Milestone 2's cost model, made concrete.** The model was
+`decode_step_cost(batch) = a + b·batch_size`. Bigger batches amortize
+the constant `a`, but the linear `b·batch_size` term starts to dominate.
+The optimal batch size is often *below* the maximum the GPU can hold —
+which is why production engines expose `max_num_seqs` as a tunable knob
+rather than a derived value.
+
+### What didn't work — and why that matters
+
+The int4 (AWQ) sweep produced **zero completed requests** in all
+configurations. The vLLM server started and answered `/health` normally,
+but every request from the benchmark client returned `404 Not Found` on
+`/v1/completions`.
+
+Root cause: the `Qwen/Qwen2.5-0.5B-Instruct-AWQ` model repo lacks a chat
+template in its tokenizer config, so `vllm bench serve` fell through to
+the legacy completions endpoint that vLLM 0.30.0 no longer serves for
+chat models. The failure was at the HTTP layer, not the model or kernel.
+
+**This is a real production hazard.** Quantized model shards on HF are
+frequently missing metadata that the base repo includes. Swapping a
+quantized variant into a working pipeline can silently break it — the
+server looks healthy, healthchecks pass, and clients get 404s. This is
+exactly the class of failure that a **gateway** (Milestone 5) is
+designed to catch: it validates backend behavior, not just backend
+liveness.
+
+Fix path (deferred): use the `openai-chat` benchmark backend, or
+substitute `Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4` which ships a fuller
+tokenizer config.
+
+### Reproduce
+
+Colab setup and sweep cells: `04_serving_benchmarks/colab_setup.md` and
+`04_serving_benchmarks/run_sweep.ipynb`. Local aggregation:
+`uv run 04_serving_benchmarks/parse_results.py`.
 
 ### Next
 
-Paging gives us a memory allocator. Milestone 4 replaces our simulated
-cost model with real vLLM on a T4, and measures what all of this looks
-like when actual kernels are involved.
+The serving engine exists and scales. But clients don't talk to vLLM
+directly. Milestone 5 builds a FastAPI gateway — routing, retries with
+exponential backoff, Prometheus metrics, and fallback to a free cloud
+API — the layer that turns an engine into a service.

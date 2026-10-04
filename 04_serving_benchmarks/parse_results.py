@@ -1,9 +1,14 @@
 """Aggregate vLLM sweep JSONs into a single CSV + charts.
 
-Input:  results/*.json    (one per (config, concurrency) run)
-Output: results.csv       (one row per run)
-        throughput.png    (output tokens/sec vs concurrency)
-        ttft_p95.png      (tail TTFT vs concurrency)
+Schema matches vLLM 0.30.0's `benchmark_serving.py` output:
+- Aggregates: median_* (= P50), p99_*, mean_*, std_* for ttft / itl / tpot
+- Arrays: `latencies` (end-to-end, seconds), `queue_times` (seconds)
+- Throughput: request_throughput, output_throughput
+
+Note: vLLM 0.30.0 does NOT emit P95. We report P50 and P99.
+
+Input:  results/*.json
+Output: results.csv, throughput.png, ttft_p99.png, latency_p99.png
 """
 from __future__ import annotations
 import csv
@@ -19,31 +24,55 @@ RESULTS = HERE / "results"
 OUT_CSV = HERE / "results.csv"
 
 
+def percentile(values: list[float], p: float) -> float:
+    """Linear-interpolation percentile. `p` in [0, 100]."""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    k = (len(s) - 1) * p / 100.0
+    lo, hi = int(k), min(int(k) + 1, len(s) - 1)
+    return s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+
 def load_runs() -> list[dict]:
     rows = []
     for path in sorted(RESULTS.glob("*.json")):
-        if path.name.endswith("_server.log"):
-            continue
         with path.open() as f:
             try:
                 data = json.load(f)
             except json.JSONDecodeError:
                 continue
 
-        # vLLM's benchmark_serving output fields (names vary by version).
-        # We defensively read what's available.
+        # per-request end-to-end latencies, in seconds → ms
+        latencies_s = data.get("latencies") or []
+        latencies_ms = [x * 1000.0 for x in latencies_s]
+
         rows.append({
             "run": path.stem,
-            "throughput_rps":     data.get("request_throughput"),
-            "throughput_tps":     data.get("output_throughput"),
-            "ttft_p50_ms":        data.get("median_ttft_ms"),
-            "ttft_p95_ms":        data.get("p95_ttft_ms"),
-            "itl_p50_ms":         data.get("median_itl_ms"),
-            "itl_p95_ms":         data.get("p95_itl_ms"),
-            "tpot_p50_ms":        data.get("median_tpot_ms"),
-            "tpot_p95_ms":        data.get("p95_tpot_ms"),
-            "e2e_p50_ms":         data.get("median_e2el_ms"),
-            "e2e_p95_ms":         data.get("p95_e2el_ms"),
+            # throughput
+            "request_throughput_rps": data.get("request_throughput"),
+            "output_throughput_tps":  data.get("output_throughput"),
+            "total_throughput_tps":   data.get("total_token_throughput"),
+            # TTFT (P50 = median, P99 = tail)
+            "ttft_p50_ms":  data.get("median_ttft_ms"),
+            "ttft_p99_ms":  data.get("p99_ttft_ms"),
+            "ttft_mean_ms": data.get("mean_ttft_ms"),
+            # ITL
+            "itl_p50_ms":  data.get("median_itl_ms"),
+            "itl_p99_ms":  data.get("p99_itl_ms"),
+            "itl_mean_ms": data.get("mean_itl_ms"),
+            # TPOT
+            "tpot_p50_ms":  data.get("median_tpot_ms"),
+            "tpot_p99_ms":  data.get("p99_tpot_ms"),
+            # end-to-end latency (computed from raw array)
+            "e2e_p50_ms": percentile(latencies_ms, 50),
+            "e2e_p95_ms": percentile(latencies_ms, 95),
+            "e2e_p99_ms": percentile(latencies_ms, 99),
+            # metadata
+            "duration_s":      data.get("duration"),
+            "completed":       data.get("completed"),
+            "failed":          data.get("failed"),
+            "max_concurrency": data.get("max_concurrency"),
         })
     return rows
 
@@ -76,48 +105,48 @@ def main() -> None:
         w.writerows(rows)
     print(f"wrote {OUT_CSV} ({len(rows)} rows)")
 
-    configs = sorted({r["config"] for r in rows})
+    configs = sorted({
+    r["config"] for r in rows
+    if (r.get("completed") or 0) > 0
+    })
     colors = plt.cm.tab10.colors
 
-    # Chart 1: throughput vs concurrency
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for i, cfg in enumerate(configs):
-        sub = sorted(
-            [r for r in rows if r["config"] == cfg and r["concurrency"] is not None],
-            key=lambda r: r["concurrency"],
-        )
-        xs = [r["concurrency"] for r in sub]
-        ys = [r["throughput_tps"] for r in sub]
-        ax.plot(xs, ys, "o-", color=colors[i % len(colors)], label=cfg)
-    ax.set_xlabel("max concurrency")
-    ax.set_ylabel("throughput (output tokens/sec)")
-    ax.set_title("vLLM: output throughput vs concurrency")
-    ax.set_xscale("log", base=2)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(HERE / "throughput.png", dpi=120)
-    print(f"wrote {HERE / 'throughput.png'}")
+    def plot(metric_key: str, ylabel: str, title: str, filename: str) -> None:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        for i, cfg in enumerate(configs):
+            sub = sorted(
+                [r for r in rows
+                 if r["config"] == cfg and r["concurrency"] is not None],
+                key=lambda r: r["concurrency"],
+            )
+            xs = [r["concurrency"] for r in sub]
+            ys = [r[metric_key] for r in sub]
+            ax.plot(xs, ys, "o-", color=colors[i % len(colors)], label=cfg)
+        ax.set_xlabel("max concurrency")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.set_xscale("log", base=2)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        fig.tight_layout()
+        out = HERE / filename
+        fig.savefig(out, dpi=120)
+        print(f"wrote {out}")
 
-    # Chart 2: P95 TTFT vs concurrency
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for i, cfg in enumerate(configs):
-        sub = sorted(
-            [r for r in rows if r["config"] == cfg and r["concurrency"] is not None],
-            key=lambda r: r["concurrency"],
-        )
-        xs = [r["concurrency"] for r in sub]
-        ys = [r["ttft_p95_ms"] for r in sub]
-        ax.plot(xs, ys, "o-", color=colors[i % len(colors)], label=cfg)
-    ax.set_xlabel("max concurrency")
-    ax.set_ylabel("TTFT P95 (ms)")
-    ax.set_title("vLLM: tail TTFT vs concurrency")
-    ax.set_xscale("log", base=2)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(HERE / "ttft_p95.png", dpi=120)
-    print(f"wrote {HERE / 'ttft_p95.png'}")
+    plot("output_throughput_tps",
+         "throughput (output tokens/sec)",
+         "vLLM: output throughput vs concurrency",
+         "throughput.png")
+
+    plot("ttft_p99_ms",
+         "TTFT P99 (ms)",
+         "vLLM: tail TTFT vs concurrency",
+         "ttft_p99.png")
+
+    plot("e2e_p99_ms",
+         "end-to-end P99 latency (ms)",
+         "vLLM: tail end-to-end latency vs concurrency",
+         "latency_p99.png")
 
 
 if __name__ == "__main__":

@@ -15,15 +15,9 @@ Confirm: `!nvidia-smi`
     !hf download Qwen/Qwen2.5-0.5B-Instruct
     !hf download Qwen/Qwen2.5-0.5B-Instruct-AWQ
 
-Note: `huggingface-cli` is deprecated in favor of `hf`. The old name
-still runs but prints a deprecation warning.
 
 ## 4. vLLM 0.30.0 specifics
 
-- Use `vllm serve`, NOT `vllm server` (the deprecation message in 0.30.0
-  incorrectly says `vllm server`).
-- `--disable-log-requests` does not exist; the flag is `--enable-log-requests`
-  and logging is off by default.
 - Benchmark CLI: `vllm bench serve`.
 - First server boot takes 60–180 s on a cold T4. Set wait timeout to 300 s.
 

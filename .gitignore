@@ -4,3 +4,4 @@ __pycache__/
 *.pt
 .venv/
 .env
+05_gateway/load_test_results.csv

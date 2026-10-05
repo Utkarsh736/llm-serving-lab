@@ -12,7 +12,7 @@ Five layers, built in order:
 | Continuous batching | `02_batching_sim/` | ✅ done |
 | Paged memory | `03_paged_memory/` | ✅ done |
 | vLLM config sweep | `04_serving_benchmarks/` | ✅ done |
-| FastAPI gateway | `05_gateway/` | planned |
+| FastAPI gateway | `05_gateway/` | ✅ done |
 
 ## 1. KV cache
 
@@ -322,9 +322,103 @@ Colab setup and sweep cells: `04_serving_benchmarks/colab_setup.md` and
 `04_serving_benchmarks/run_sweep.ipynb`. Local aggregation:
 `uv run 04_serving_benchmarks/parse_results.py`.
 
-### Next
+## 5. Gateway
 
-The serving engine exists and scales. But clients don't talk to vLLM
-directly. Milestone 5 builds a FastAPI gateway — routing, retries with
-exponential backoff, Prometheus metrics, and fallback to a free cloud
-API — the layer that turns an engine into a service.
+### What it is
+
+Clients don't talk to vLLM (or Groq, or any model server) directly.
+They talk to a gateway — a layer that routes requests, retries
+transient failures, falls back to alternate backends, and reports
+metrics.
+
+Milestones 1–4 built the serving engine. This milestone builds the
+thing that makes it a *service*.
+
+### Architecture
+
+client → FastAPI gateway → backend chain
+├── groq (free API, real latency)
+├── vllm (local, when a GPU is available)
+└── mock (local dev, tests)
+
+Backends implement a common `Protocol`:
+
+    name: str
+    async generate(prompt, max_tokens, temperature) -> str
+    async is_healthy() -> bool
+
+The gateway iterates the chain. For each backend: if unhealthy, skip.
+If healthy, try up to 3 times with exponential backoff + jitter
+(retryable: timeouts, connection errors, 429s, 5xx). On success, return.
+On exhaustion, fall to the next backend. If all fail, return 503.
+
+### Files
+
+- `app.py` — FastAPI routes (`/generate`, `/health`, `/backends`, `/metrics`)
+- `backends.py` — `Backend` Protocol, `MockBackend`, `GroqBackend`, `VLLMBackend`
+- `retry.py` — `with_retry()` helper with backoff + jitter
+- `metrics.py` — Prometheus counters, histograms, gauges
+- `load_test.py` — concurrent load generator
+- `test_gateway.py` — pytest tests (planned)
+
+### Load test results
+
+Two runs against the running gateway:
+
+| backend | n | concurrency | throughput | P50 | P95 | P99 | errors |
+|---|---|---|---|---|---|---|---|
+| mock | 100 | 20 | 272 req/s | 55.8 ms | 91.6 ms | 93.0 ms | 0 |
+| groq | 20  | 5  | 5.66 req/s | 731 ms | 1105 ms | 1476 ms | 0 |
+
+**Gateway overhead is small.** Mock P50 was 55.8 ms against a 50 ms
+artificial delay — ~6 ms of HTTP + JSON + asyncio overhead per request.
+The gateway is not the bottleneck.
+
+**Real backend latency dominates.** Groq P50 was 731 ms, P99 1476 ms.
+The spread between them is network + API queueing. The gateway faithfully
+relays that variance; it doesn't manufacture it.
+
+**Fallback and retry were not needed.** All 20 Groq requests succeeded
+on the first attempt. The chain exists but was idle, which is the
+healthy case.
+
+### Metrics
+
+`GET /metrics` exposes Prometheus-format counters and histograms:
+
+- `gateway_requests_total{backend, status}` — client requests served
+  (or failed) per backend
+- `gateway_request_latency_seconds{backend}` — end-to-end latency
+  histogram with `_bucket`, `_sum`, `_count`
+- `gateway_backend_attempts_total{backend, outcome}` — per-backend call
+  attempts, distinguishing retries from first-try successes
+- `gateway_backends_healthy{backend}` — 0/1 gauge, updated at startup
+  and on every `/health` call
+
+After the load test, counters agreed with the load test's own output
+(`attempts=20`, `requests=20`), confirming the instrumentation is
+correct.
+
+### What this catches — the M4 lesson
+
+In Milestone 4, the int4 AWQ backend was *alive* (health check passed,
+`/v1/models` responded) but *broken* (404 on every `/generate`). A
+naive gateway that only checked liveness would have passed those
+requests through. A gateway that validates behavior — which is what
+`Backend.is_healthy()` should do, and what `GroqBackend.is_healthy()`
+now does by verifying the configured model appears in `/v1/models` —
+catches this at the routing layer.
+
+### Reproduce
+
+    # terminal 1: start the gateway
+    GATEWAY_BACKENDS=groq,mock uv run uvicorn --app-dir 05_gateway app:app --port 8000
+
+    # terminal 2: load test
+    uv run 05_gateway/load_test.py --n 20 --concurrency 5 --max-tokens 64
+
+    # check metrics
+    curl -s http://localhost:8000/metrics | grep -E '^gateway_'
+
+Requires `GROQ_API_KEY` in `.env`. For a GPU-free local test, set
+`GATEWAY_BACKENDS=mock`.

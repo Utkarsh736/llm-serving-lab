@@ -8,6 +8,7 @@ dependencies = [
     "matplotlib>=3.11.2",
     "numpy>=2.4.6",
     "pandas>=3.0.6",
+    "prometheus-client>=0.26.0",
     "python-dotenv>=1.2.4",
     "torch>=2.14.1",
     "uvicorn>=0.54.0",
